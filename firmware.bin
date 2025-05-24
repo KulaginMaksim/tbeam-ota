@@ -7,76 +7,39 @@
 #include <time.h>
 #include <algorithm>
 
+#define MAX_SAFE_POINTS 20
 
-// ------------------ TELEGRAM CONFIG -------------------
+// Безопасная зона
+double safeZoneLats[MAX_SAFE_POINTS];
+double safeZoneLngs[MAX_SAFE_POINTS];
+int safeZoneIndex = 0;
+bool safeZoneReady = false;
+double safeZoneLatCenter = 0.0;
+double safeZoneLngCenter = 0.0;
+
+// WiFi / Telegram
 const char* ssid = "MEO-7C6930";
 const char* password = "0d2ad4596f";
 const char* BOT_TOKEN = "7090059734:AAECfFez6-5pJVqOviJyZhXtmvfn9NMDfBE";
 const char* CHAT_ID = "220442872";
-// ------------------------------------------------------
-
 
 unsigned long lastSendTime = 0;
-const unsigned long sendInterval = 15000; // 15 секунд
+const unsigned long sendInterval = 15000;
 
-
-// GPS Serial Pins
 #define GPS_RX_PIN 34
 #define GPS_TX_PIN 12
-
-// I2C for AXP2101
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
+#define GPS_BAUD_RATE 9600
 
 TinyGPSPlus gps;
 HardwareSerial GPS_Serial(1);
 XPowersAXP2101 power;
 
-#define GPS_BAUD_RATE 9600
-
-void setup() {
-  Serial.begin(115200);
-  while (!Serial);
-  Serial.println("GPS T-Beam + Telegram");
-
-  // WiFi Init
-  Serial.print("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
-
-  // --- Check Telegram DNS ---
-  IPAddress tg_ip;
-  if (WiFi.hostByName("api.telegram.org", tg_ip)) {
-    Serial.print("🔗 Telegram API IP: ");
-    Serial.println(tg_ip);
-  } else {
-    Serial.println("❌ DNS lookup for Telegram failed!");
-  }
-  Serial.println(WiFi.dnsIP());
-
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  if (!power.init()) {
-    Serial.println("PMIC FAIL");
-    while (1) delay(1000);
-  }
-  power.setProtectedChannel(XPOWERS_ALDO2);
-  power.enableALDO2(); // Включить GPS
-
-  GPS_Serial.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  fakeTime();
-
-}
-
-
 void fakeTime() {
-  // Пример: 24 мая 2025 03:00:00 UTC
   struct tm t;
   t.tm_year = 2025 - 1900;
-  t.tm_mon = 5;     // Май = 5 (янв = 0)
+  t.tm_mon = 5;
   t.tm_mday = 24;
   t.tm_hour = 3;
   t.tm_min = 0;
@@ -84,79 +47,98 @@ void fakeTime() {
   time_t fakeEpoch = mktime(&t);
   struct timeval now = { .tv_sec = fakeEpoch };
   settimeofday(&now, nullptr);
-
   Serial.println("⚠️ Используем подставное время (без NTP)");
   Serial.print("🕒 ");
   Serial.println(ctime(&fakeEpoch));
 }
 
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("GPS T-Beam + Telegram");
 
-void syncTime() {
-  configTime(0, 0, "time.google.com", "time.nist.gov", "pool.ntp.org");
-  setenv("TZ", "UTC0", 1);  // или нужный тебе часовой пояс
-  tzset();
-
-  Serial.println("⏳ Waiting for NTP time sync...");
-
-  int waitSec = 0;
-  time_t now = time(nullptr);
-  while (now < 100000 && waitSec < 10) {
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    waitSec++;
-    now = time(nullptr);
   }
+  Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
 
-  Serial.println();
-  if (now >= 100000) {
-    Serial.println("✅ Time synced.");
-    Serial.print("🕒 ");
-    Serial.println(ctime(&now));
-  } else {
-    Serial.println("❌ Time sync FAILED. Using default time.");
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  if (!power.init()) {
+    Serial.println("PMIC FAIL");
+    while (1) delay(1000);
   }
+  power.setProtectedChannel(XPOWERS_ALDO2);
+  power.enableALDO2();
+
+  GPS_Serial.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  fakeTime();
 }
-
 
 void loop() {
   while (GPS_Serial.available() > 0) {
     char c = GPS_Serial.read();
-    Serial.write(c); // покажет "сырые" NMEA данные, если приходят
+    Serial.write(c);
     if (gps.encode(c) && gps.location.isValid()) {
-    if (millis() - lastSendTime > sendInterval) {
-    displayAndSendInfo();
-    lastSendTime = millis();
-    if (millis() % 5000 < 50) {
-    Serial.print("📡 Спутники: ");
-    Serial.println(gps.satellites.value());
-    Serial.print("📶 HDOP: ");
-    Serial.println(gps.hdop.value() / 100.0);
-}
-
+      if (millis() - lastSendTime > sendInterval) {
+        displayAndSendInfo();
+        lastSendTime = millis();
+      }
+    }
   }
-}
-  }
-
   if (millis() > 5000 && gps.charsProcessed() < 10) {
     Serial.println("WARNING: No GPS data!");
-    ESP.restart();  // если GPS завис
+    ESP.restart();
   }
 }
 
+void addSafePoint(double lat, double lng) {
+  if (safeZoneIndex >= MAX_SAFE_POINTS) return;
+  safeZoneLats[safeZoneIndex] = lat;
+  safeZoneLngs[safeZoneIndex] = lng;
+  safeZoneIndex++;
 
+  if (safeZoneIndex == MAX_SAFE_POINTS) {
+    std::sort(safeZoneLats, safeZoneLats + MAX_SAFE_POINTS);
+    std::sort(safeZoneLngs, safeZoneLngs + MAX_SAFE_POINTS);
+    safeZoneLatCenter = safeZoneLats[MAX_SAFE_POINTS / 2];
+    safeZoneLngCenter = safeZoneLngs[MAX_SAFE_POINTS / 2];
+    safeZoneReady = true;
+    Serial.println("✅ Безопасная зона установлена");
+    Serial.printf("Центр: %.6f, %.6f\n", safeZoneLatCenter, safeZoneLngCenter);
+  }
+}
+
+bool maleraiusCheck(double currentLat, double currentLng) {
+  if (!safeZoneReady) return false;
+  double distFromCenter = distanceBetween(currentLat, currentLng, safeZoneLatCenter, safeZoneLngCenter);
+  return distFromCenter > 50.0;
+}
+
+double distanceBetween(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000;
+  double dLat = radians(lat2 - lat1);
+  double dLon = radians(lon2 - lon1);
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(radians(lat1)) * cos(radians(lat2)) *
+             sin(dLon / 2) * sin(dLon / 2);
+  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
 
 void displayAndSendInfo() {
-  if (!gps.location.isValid()) {
-    Serial.println("INVALID | Lat: --- | Lng: ---");
-    return;
-  }
-
   static double lastLat = 0, lastLng = 0;
   static unsigned long lastSent = 0;
   static bool wasMoving = false;
   static double moveBuffer[5] = {0};
   static int bufferIndex = 0;
   static bool gpsInitialized = false;
+
+  if (!gps.location.isValid()) {
+    Serial.println("INVALID | Lat: --- | Lng: ---");
+    return;
+  }
 
   double lat = gps.location.lat();
   double lng = gps.location.lng();
@@ -169,23 +151,20 @@ void displayAndSendInfo() {
     return;
   }
 
-  double dist = distanceBetween(lastLat, lastLng, lat, lng); // метры
+  if (!safeZoneReady) addSafePoint(lat, lng);
+
+  double dist = distanceBetween(lastLat, lastLng, lat, lng);
   unsigned long now = millis();
 
-  // Качество сигнала
-  bool gpsGood = gps.hdop.value() / 100.0 <= 2.0 && gps.satellites.value() >= 6;
-
-  // Обновляем буфер смещений
   moveBuffer[bufferIndex] = dist;
   bufferIndex = (bufferIndex + 1) % 5;
 
-  // Медианный фильтр
   double tempBuffer[5];
   memcpy(tempBuffer, moveBuffer, sizeof(moveBuffer));
   std::sort(tempBuffer, tempBuffer + 5);
   double medianDist = tempBuffer[2];
 
-  // Проверка: все 5 точек выше 35м
+  bool gpsGood = gps.hdop.value() / 100.0 <= 2.0 && gps.satellites.value() >= 6;
   bool allAboveThreshold = true;
   for (int i = 0; i < 5; i++) {
     if (moveBuffer[i] <= 35.0) {
@@ -194,10 +173,9 @@ void displayAndSendInfo() {
     }
   }
 
-  // Условия движения
-  bool isMoving = gpsGood && dist > 35.0 && medianDist > 35.0 && allAboveThreshold;
+  bool distOk = dist > 30.0 && medianDist > 30.0 && maleraiusCheck(lat, lng);
+  bool isMoving = gpsGood && distOk;
 
-  // Не шлем, если статус не поменялся и прошло мало времени
   if (isMoving == wasMoving) {
     if ((isMoving && (now - lastSent < 15000)) || (!isMoving && (now - lastSent < 3600000))) {
       Serial.println(isMoving ? "🏃 Движемся. Подождём..." : "🧍 Стационарно. Подождём...");
@@ -205,24 +183,19 @@ void displayAndSendInfo() {
     }
   }
 
-  // Сохраняем состояние
   lastLat = lat;
   lastLng = lng;
   lastSent = now;
   wasMoving = isMoving;
 
-  // Получаем статус батареи
-  float battVoltage = power.getBattVoltage(); // в милливольтах
-
-  // Данные
   int sats = gps.satellites.value();
   double hdop = gps.hdop.value() / 100.0;
   double alt = gps.altitude.meters();
+  float battVoltage = power.getBattVoltage();
 
   Serial.printf("VALID | Lat: %.6f | Lng: %.6f | Sats: %d | HDOP: %.1f | Alt: %.1fm | Dist: %.1fm | Median: %.1fm\n",
                 lat, lng, sats, hdop, alt, dist, medianDist);
 
-  // Формируем сообщение
   String msg = isMoving
       ? "🏃 Мы движемся!\n📍 GPS обновление каждые 15 секунд\n"
       : "🧍 Стационарно.\n📍 GPS обновление раз в час\n";
@@ -232,25 +205,12 @@ void displayAndSendInfo() {
   msg += "📡 Sats: " + String(sats) + "\n";
   msg += "📏 HDOP: " + String(hdop, 1) + "\n";
   msg += "🗻 Alt: " + String(alt, 1) + " м\n";
-  msg += "📏 Смещение (мгновенное): " + String(dist, 1) + " м\n";
+  msg += "📏 Смещение: " + String(dist, 1) + " м\n";
   msg += "📊 Медианное смещение: " + String(medianDist, 1) + " м\n";
-  msg += "🔋 Напряжение батареи: " + String(battVoltage / 1000.0, 2) + " В\n";
+  msg += "🔋 Батарея: " + String(battVoltage / 1000.0, 2) + " В\n";
   msg += "🗺️ https://maps.google.com/?q=" + String(lat, 6) + "," + String(lng, 6) + "\n";
 
   sendToTelegram(msg);
-}
-
-
-
-double distanceBetween(double lat1, double lon1, double lat2, double lon2) {
-  const double R = 6371000; // Радиус Земли в метрах
-  double dLat = radians(lat2 - lat1);
-  double dLon = radians(lon2 - lon1);
-  double a = sin(dLat / 2) * sin(dLat / 2) +
-             cos(radians(lat1)) * cos(radians(lat2)) *
-             sin(dLon / 2) * sin(dLon / 2);
-  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
-  return R * c;
 }
 
 bool sendToTelegram(const String& message) {
@@ -260,9 +220,9 @@ bool sendToTelegram(const String& message) {
   }
 
   WiFiClientSecure client;
-  client.setInsecure(); // Skip cert verification (simpler for embedded)
-
+  client.setInsecure();
   HTTPClient https;
+
   String url = "https://api.telegram.org/bot" + String(BOT_TOKEN) + "/sendMessage";
   String payload = "chat_id=" + String(CHAT_ID) + "&text=" + urlencode(message);
 
@@ -271,7 +231,6 @@ bool sendToTelegram(const String& message) {
   bool success = false;
 
   while (attempt < maxRetries && !success) {
-    Serial.printf("📤 Attempt %d to send Telegram message...\n", attempt + 1);
     if (!https.begin(client, url)) {
       Serial.println("❌ HTTPS begin() failed.");
       break;
@@ -279,27 +238,14 @@ bool sendToTelegram(const String& message) {
 
     https.addHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
     int httpCode = https.POST(payload);
-
-    if (httpCode > 0) {
-      Serial.printf("✅ Telegram response code: %d\n", httpCode);
-      success = (httpCode == 200);
-    } else {
-      Serial.printf("⚠️ HTTP POST failed. Code: %d | Error: %s\n", httpCode, https.errorToString(httpCode).c_str());
-    }
-
+    success = (httpCode == 200);
     https.end();
     attempt++;
-    if (!success) delay(1500); // Wait before retry
-  }
-
-  if (!success) {
-    Serial.println("❌ All attempts to send Telegram failed.");
+    if (!success) delay(1500);
   }
 
   return success;
 }
-
-
 
 String urlencode(String str) {
   String encoded = "";
