@@ -5,6 +5,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
+#include <algorithm>
 
 
 // ------------------ TELEGRAM CONFIG -------------------
@@ -156,19 +157,18 @@ void displayAndSendInfo() {
   static double moveBuffer[5] = {0};
   static int bufferIndex = 0;
   static bool gpsInitialized = false;
+
   double lat = gps.location.lat();
   double lng = gps.location.lng();
 
   if (!gpsInitialized) {
-    lastLat = gps.location.lat();
-    lastLng = gps.location.lng();
+    lastLat = lat;
+    lastLng = lng;
     gpsInitialized = true;
     Serial.println("⏳ Первая валидная точка. Инициализация координат.");
-    return; // не отправляем сразу, ждём следующую
+    return;
   }
 
-
- 
   double dist = distanceBetween(lastLat, lastLng, lat, lng); // метры
   unsigned long now = millis();
 
@@ -179,20 +179,27 @@ void displayAndSendInfo() {
   moveBuffer[bufferIndex] = dist;
   bufferIndex = (bufferIndex + 1) % 5;
 
-  // Подсчёт "реальных" смещений
-  int moveCount = 0;
+  // Медианный фильтр
+  double tempBuffer[5];
+  memcpy(tempBuffer, moveBuffer, sizeof(moveBuffer));
+  std::sort(tempBuffer, tempBuffer + 5);
+  double medianDist = tempBuffer[2];
+
+  // Проверка: все 5 точек выше 35м
+  bool allAboveThreshold = true;
   for (int i = 0; i < 5; i++) {
-    if (moveBuffer[i] > 20.0) moveCount++;
+    if (moveBuffer[i] <= 35.0) {
+      allAboveThreshold = false;
+      break;
+    }
   }
 
-  // Флаги движения
-  bool speedOk = gps.speed.kmph() > 5.0;
-  bool isMoving = gpsGood && (moveCount >= 3 || speedOk);
+  // Условия движения
+  bool isMoving = gpsGood && dist > 35.0 && medianDist > 35.0 && allAboveThreshold;
 
-  // Не отправляем, если статус не менялся и интервал мал
+  // Не шлем, если статус не поменялся и прошло мало времени
   if (isMoving == wasMoving) {
-    if ((isMoving && (now - lastSent < 15000)) ||
-        (!isMoving && (now - lastSent < 60000))) {
+    if ((isMoving && (now - lastSent < 15000)) || (!isMoving && (now - lastSent < 3600000))) {
       Serial.println(isMoving ? "🏃 Движемся. Подождём..." : "🧍 Стационарно. Подождём...");
       return;
     }
@@ -204,29 +211,36 @@ void displayAndSendInfo() {
   lastSent = now;
   wasMoving = isMoving;
 
+  // Получаем статус батареи
+  float battVoltage = power.getBattVoltage(); // в милливольтах
+
   // Данные
   int sats = gps.satellites.value();
   double hdop = gps.hdop.value() / 100.0;
   double alt = gps.altitude.meters();
 
-  Serial.printf("VALID | Lat: %.6f | Lng: %.6f | Sats: %d | HDOP: %.1f | Alt: %.1fm | Dist: %.1fm\n",
-                lat, lng, sats, hdop, alt, dist);
+  Serial.printf("VALID | Lat: %.6f | Lng: %.6f | Sats: %d | HDOP: %.1f | Alt: %.1fm | Dist: %.1fm | Median: %.1fm\n",
+                lat, lng, sats, hdop, alt, dist, medianDist);
 
   // Формируем сообщение
   String msg = isMoving
-      ? "🏃 Мы движемся!!!\n📍 Новая GPS апдейт 15 секунд\n"
-      : "🧍 Мы стоим на месте 📍\n";
+      ? "🏃 Мы движемся!\n📍 GPS обновление каждые 15 секунд\n"
+      : "🧍 Стационарно.\n📍 GPS обновление раз в час\n";
 
   msg += "🌐 Lat: " + String(lat, 6) + "\n";
   msg += "🌐 Lng: " + String(lng, 6) + "\n";
   msg += "📡 Sats: " + String(sats) + "\n";
   msg += "📏 HDOP: " + String(hdop, 1) + "\n";
-  msg += "🗻 Alt: " + String(alt, 1) + " m\n";
-  msg += "📏 Смещение: " + String(dist, 1) + " м\n";
+  msg += "🗻 Alt: " + String(alt, 1) + " м\n";
+  msg += "📏 Смещение (мгновенное): " + String(dist, 1) + " м\n";
+  msg += "📊 Медианное смещение: " + String(medianDist, 1) + " м\n";
+  msg += "🔋 Напряжение батареи: " + String(battVoltage / 1000.0, 2) + " В\n";
   msg += "🗺️ https://maps.google.com/?q=" + String(lat, 6) + "," + String(lng, 6) + "\n";
 
   sendToTelegram(msg);
 }
+
+
 
 double distanceBetween(double lat1, double lon1, double lat2, double lon2) {
   const double R = 6371000; // Радиус Земли в метрах
